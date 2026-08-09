@@ -26,7 +26,9 @@ console.log(`    npm run dev\n`);
 
 const shutdown = async () => {
   console.log("\n  Stopping MongoDB…");
-  await server.stop();
+  // `stop()` defaults to { doCleanup: true }, which deletes dbPath — that would
+  // throw away the seeded data on every Ctrl-C. Keep the directory instead.
+  await server.stop({ doCleanup: false, force: false });
   process.exit(0);
 };
 
