@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/db";
 import { updateOrderSchema } from "@/lib/validation";
-import { ApiError, validationErrorFromZod, withErrorHandling } from "@/lib/errors";
+import { validationErrorFromZod, withErrorHandling } from "@/lib/errors";
 import { requireUser } from "@/lib/auth";
-import { findOwnedOrder } from "@/lib/orders";
-import { isOrderEditable, serializeOrderDetail } from "@/lib/serialize";
-import { centsToDollarString } from "@/lib/money";
+import { deleteOrder, findOwnedOrder, updateOrder } from "@/lib/orders";
+import { serializeOrderDetail } from "@/lib/serialize";
 
 export const runtime = "nodejs";
 
@@ -34,7 +33,8 @@ export const GET = withErrorHandling(async (_request: Request, context: Context)
  *
  * Line items freeze once the first payment lands. Editing them would change the
  * total under a payment that was validated against the old one, which can leave
- * an order recorded as over-paid with no way to express that.
+ * an order recorded as over-paid with no way to express that. `updateOrder`
+ * (src/lib/orders.ts) enforces that lock atomically — see its doc comment.
  */
 export const PATCH = withErrorHandling(async (request: Request, context: Context) => {
   const user = await requireUser();
@@ -45,35 +45,17 @@ export const PATCH = withErrorHandling(async (request: Request, context: Context
   const updates = parsed.data;
 
   await connectToDatabase();
-  const order = await findOwnedOrder(user, id);
-
-  if (updates.lineItems && !isOrderEditable(order)) {
-    throw new ApiError("order_locked", "Line items cannot be changed after a payment is recorded.", {
-      hint: "Customer and due date are still editable. To change the amount, void this order and issue a new one.",
-      meta: {
-        paymentCount: order.payments.length,
-        amountPaidCents: order.amountPaidCents,
-        amountPaid: centsToDollarString(order.amountPaidCents),
-      },
-    });
-  }
-
-  if (updates.customer !== undefined) order.customer = updates.customer;
-  if (updates.dueDate !== undefined) order.dueDate = updates.dueDate;
-  if (updates.lineItems !== undefined) {
-    order.set(
-      "lineItems",
-      updates.lineItems.map((item) => ({
-        description: item.description,
-        quantity: item.quantity,
-        unitPriceCents: item.unitPrice,
-        lineTotalCents: item.quantity * item.unitPrice,
-      })),
-    );
-  }
-
-  // Totals are recomputed by the model's pre-validate hook.
-  await order.save();
+  const order = await updateOrder({
+    userId: user.id,
+    orderId: id,
+    customer: updates.customer,
+    dueDate: updates.dueDate,
+    lineItems: updates.lineItems?.map((item) => ({
+      description: item.description,
+      quantity: item.quantity,
+      unitPriceCents: item.unitPrice,
+    })),
+  });
 
   return NextResponse.json({ order: serializeOrderDetail(order) });
 });
@@ -83,26 +65,15 @@ export const PATCH = withErrorHandling(async (request: Request, context: Context
  *
  * Blocked once payments exist: deleting an order with money against it destroys
  * the record of that money. Those orders have to be handled deliberately
- * (refund, then void) rather than by a delete button.
+ * (refund, then void) rather than by a delete button. `deleteOrder`
+ * (src/lib/orders.ts) enforces that atomically — see its doc comment.
  */
 export const DELETE = withErrorHandling(async (_request: Request, context: Context) => {
   const user = await requireUser();
   const { id } = await context.params;
 
   await connectToDatabase();
-  const order = await findOwnedOrder(user, id);
-
-  if (order.payments.length > 0) {
-    throw new ApiError("order_locked", "Orders with recorded payments cannot be deleted.", {
-      hint: "Refund the payments first, or keep the order for your records.",
-      meta: {
-        paymentCount: order.payments.length,
-        amountPaid: centsToDollarString(order.amountPaidCents),
-      },
-    });
-  }
-
-  await order.deleteOne();
+  await deleteOrder(user.id, id);
 
   return NextResponse.json({ ok: true, id });
 });

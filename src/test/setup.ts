@@ -15,6 +15,20 @@ export async function startTestDatabase(): Promise<string> {
   server = await MongoMemoryServer.create();
   const uri = server.getUri();
   await mongoose.connect(uri, { dbName: "test" });
+
+  // `connectToDatabase` (src/lib/db.ts) — what route handlers actually call —
+  // reads `MONGODB_URI` and caches its own connection on `globalThis`,
+  // separate from the default connection above. Point both at this same
+  // in-memory server so route-handler tests (which go through
+  // `connectToDatabase`) share it rather than dialing a second connection.
+  // A no-op for tests that only touch models directly.
+  process.env.MONGODB_URI = uri;
+  (
+    globalThis as {
+      __mongooseCache?: { conn: typeof mongoose | null; promise: Promise<typeof mongoose> | null };
+    }
+  ).__mongooseCache = { conn: mongoose, promise: Promise.resolve(mongoose) };
+
   return uri;
 }
 

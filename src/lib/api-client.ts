@@ -1,5 +1,5 @@
 import type { ApiErrorBody } from "./errors";
-import type { OrderDetailJson, OrderSummaryJson } from "./serialize";
+import type { OrderAggregatesJson, OrderDetailJson, OrderSummaryJson } from "./serialize";
 import type { OrderStatus } from "./status";
 
 /**
@@ -72,14 +72,15 @@ export const api = {
 
   me: () => request<{ user: { id: string; email: string } | null }>("/api/auth/me"),
 
-  listOrders: (params: { status?: OrderStatus | "all"; search?: string } = {}) => {
+  listOrders: (params: { status?: OrderStatus | "all"; search?: string; page?: number } = {}) => {
     const query = new URLSearchParams();
     if (params.status && params.status !== "all") query.set("status", params.status);
     if (params.search) query.set("search", params.search);
-    query.set("pageSize", "100");
+    if (params.page && params.page > 1) query.set("page", String(params.page));
     return request<{
       orders: OrderSummaryJson[];
       pagination: { page: number; pageSize: number; total: number; totalPages: number };
+      aggregates: OrderAggregatesJson;
     }>(`/api/orders?${query}`);
   },
 

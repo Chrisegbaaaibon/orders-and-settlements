@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { MoneyParseError, centsToDollarString, parseDollarsToCents } from "./money";
+import {
+  MAX_AMOUNT_CENTS,
+  MoneyParseError,
+  centsToDollarString,
+  computeLineTotalCents,
+  computeLineTotals,
+  parseDollarsToCents,
+  sumLineTotalsCents,
+} from "./money";
 
 describe("parseDollarsToCents", () => {
   it("parses whole dollars and cents", () => {
@@ -39,6 +47,59 @@ describe("parseDollarsToCents", () => {
 
   it("rejects amounts above the ceiling", () => {
     expect(() => parseDollarsToCents("9999999999")).toThrow(/maximum/);
+  });
+});
+
+describe("computeLineTotalCents", () => {
+  it("multiplies quantity by unit price", () => {
+    expect(computeLineTotalCents(3, 1_999)).toBe(5_997);
+  });
+
+  it("rejects a quantity/price combination that overflows a safe integer", () => {
+    // Each input independently passes the field-level bounds (unit price
+    // capped at MAX_AMOUNT_CENTS, quantity capped at 1,000,000) but their
+    // product does not fit in Number.MAX_SAFE_INTEGER.
+    const unitPriceCents = MAX_AMOUNT_CENTS; // $1,000,000,000.00
+    const quantity = 1_000_000;
+    expect(Number.isSafeInteger(quantity * unitPriceCents)).toBe(false);
+    expect(() => computeLineTotalCents(quantity, unitPriceCents)).toThrow(MoneyParseError);
+  });
+
+  it("rejects a single line total above the order ceiling even when it is a safe integer", () => {
+    // 2 x MAX_AMOUNT_CENTS is a safe integer, but a single line still should
+    // not be allowed to exceed the same ceiling applied to a whole order.
+    expect(Number.isSafeInteger(2 * MAX_AMOUNT_CENTS)).toBe(true);
+    expect(() => computeLineTotalCents(2, MAX_AMOUNT_CENTS)).toThrow(/maximum/);
+  });
+});
+
+describe("sumLineTotalsCents", () => {
+  it("sums line totals", () => {
+    expect(sumLineTotalsCents([5_997, 25_000])).toBe(30_997);
+  });
+
+  it("rejects a running sum that exceeds the ceiling even though every line is individually valid", () => {
+    const withinCeiling = Array.from({ length: 200 }, () => MAX_AMOUNT_CENTS / 1_000);
+    expect(() => sumLineTotalsCents(withinCeiling)).not.toThrow(); // sums to well under the ceiling
+    const tooMany = Array.from({ length: 200 }, () => MAX_AMOUNT_CENTS);
+    expect(() => sumLineTotalsCents(tooMany)).toThrow(MoneyParseError);
+  });
+});
+
+describe("computeLineTotals", () => {
+  it("computes every line total and the subtotal together", () => {
+    const result = computeLineTotals([
+      { quantity: 3, unitPriceCents: 1_999 },
+      { quantity: 1, unitPriceCents: 25_000 },
+    ]);
+    expect(result.lineTotalsCents).toEqual([5_997, 25_000]);
+    expect(result.subtotalCents).toBe(30_997);
+  });
+
+  it("rejects the accepted-but-overflowing combination from the audit: a $1B unit price times a million units", () => {
+    expect(() =>
+      computeLineTotals([{ quantity: 1_000_000, unitPriceCents: MAX_AMOUNT_CENTS }]),
+    ).toThrow(MoneyParseError);
   });
 });
 

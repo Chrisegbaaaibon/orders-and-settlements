@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MoneyParseError, parseDollarsToCents } from "./money";
+import { computeLineTotals, MoneyParseError, parseDollarsToCents } from "./money";
 import { ORDER_STATUSES } from "./status";
 
 /**
@@ -31,13 +31,37 @@ const dollarsAsCents = (opts: { min: number; label: string }) =>
     return cents;
   });
 
-/** A calendar date, accepted as "YYYY-MM-DD" or ISO, normalised to UTC midnight. */
-const calendarDate = z
+/**
+ * A calendar date, accepted as "YYYY-MM-DD" or ISO, normalised to UTC midnight.
+ *
+ * `Date.UTC` and the `Date` constructor both *normalise* an out-of-range day
+ * rather than reject it — `Date.UTC(2026, 1, 30)` silently becomes March 2,
+ * not an error. For the day-only form that is the common one on this form
+ * (due dates typed as "2026-02-30"), so the round-trip is checked explicitly:
+ * if the date we get back doesn't have the year/month/day we put in, the
+ * input wasn't a real calendar date.
+ */
+export const calendarDate = z
   .string()
   .min(1, "Date is required")
   .transform((value, ctx) => {
-    const isDayOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
-    const parsed = new Date(isDayOnly ? `${value}T00:00:00.000Z` : value);
+    const dayOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (dayOnly) {
+      const [, yearStr, monthStr, dayStr] = dayOnly;
+      const year = Number(yearStr);
+      const month = Number(monthStr);
+      const day = Number(dayStr);
+      const date = new Date(Date.UTC(year, month - 1, day));
+      const roundTrips =
+        date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+      if (!roundTrips) {
+        ctx.addIssue({ code: "custom", message: "Must be a valid calendar date (YYYY-MM-DD)" });
+        return z.NEVER;
+      }
+      return date;
+    }
+
+    const parsed = new Date(value);
     if (Number.isNaN(parsed.getTime())) {
       ctx.addIssue({ code: "custom", message: "Must be a valid date (YYYY-MM-DD)" });
       return z.NEVER;
@@ -71,10 +95,32 @@ export const lineItemSchema = z.object({
   unitPrice: dollarsAsCents({ min: 0, label: "Unit price" }),
 });
 
+/**
+ * `lineItemSchema` bounds quantity and unit price individually, but their
+ * product (and the running subtotal across up to 200 lines) can still overflow
+ * `Number.MAX_SAFE_INTEGER` even though every individual field passed its own
+ * check. Reject that combination here, at the API boundary, rather than
+ * discovering it via silent precision loss in the database.
+ */
+const lineItemsArraySchema = z
+  .array(lineItemSchema)
+  .min(1, "An order needs at least one line item")
+  .max(200)
+  .superRefine((items, ctx) => {
+    try {
+      computeLineTotals(items.map((item) => ({ quantity: item.quantity, unitPriceCents: item.unitPrice })));
+    } catch (error) {
+      ctx.addIssue({
+        code: "custom",
+        message: error instanceof MoneyParseError ? error.message : "Invalid line items",
+      });
+    }
+  });
+
 export const createOrderSchema = z.object({
   customer: z.string().trim().min(1, "Customer is required").max(200),
   dueDate: calendarDate,
-  lineItems: z.array(lineItemSchema).min(1, "An order needs at least one line item").max(200),
+  lineItems: lineItemsArraySchema,
 });
 
 /**

@@ -5,6 +5,7 @@ import { User } from "@/models/User";
 import { credentialsSchema } from "@/lib/validation";
 import { ApiError, validationErrorFromZod, withErrorHandling } from "@/lib/errors";
 import { setSessionCookie } from "@/lib/auth";
+import { assertNotRateLimited, clientIp } from "@/lib/rateLimit";
 
 export const runtime = "nodejs";
 
@@ -13,6 +14,11 @@ export const POST = withErrorHandling(async (request: Request) => {
   if (!parsed.success) throw validationErrorFromZod(parsed.error);
 
   const { email, password } = parsed.data;
+
+  // Bounds mass account creation from one source; unlike login there is no
+  // existing account to key a second dimension off of.
+  assertNotRateLimited(`signup:ip:${clientIp(request)}`, { max: 10, windowMs: 15 * 60_000 });
+
   await connectToDatabase();
 
   const passwordHash = await bcrypt.hash(password, 12);

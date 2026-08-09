@@ -5,8 +5,9 @@ import { Order, type OrderDoc } from "@/models/Order";
 import { createOrderSchema, listOrdersQuerySchema } from "@/lib/validation";
 import { validationErrorFromZod, withErrorHandling } from "@/lib/errors";
 import { requireUser } from "@/lib/auth";
-import { serializeOrderDetail, serializeOrderSummary } from "@/lib/serialize";
+import { serializeOrderAggregates, serializeOrderDetail, serializeOrderSummary } from "@/lib/serialize";
 import { statusFilter } from "@/lib/orderQuery";
+import { computeOrderAggregates } from "@/lib/orders";
 
 export const runtime = "nodejs";
 
@@ -28,17 +29,20 @@ export const GET = withErrorHandling(async (request: Request) => {
   if (status) Object.assign(filter, statusFilter(status, now));
   if (search) filter.customer = { $regex: escapeRegex(search), $options: "i" };
 
-  const [orders, total] = await Promise.all([
+  const [orders, total, aggregates] = await Promise.all([
     Order.find(filter)
       .sort({ createdAt: -1 })
       .skip((page - 1) * pageSize)
       .limit(pageSize),
     Order.countDocuments(filter),
+    // Over the whole filtered set, not just this page — see computeOrderAggregates.
+    computeOrderAggregates(filter, now),
   ]);
 
   return NextResponse.json({
     orders: orders.map((order) => serializeOrderSummary(order, now)),
     pagination: { page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) },
+    aggregates: serializeOrderAggregates(aggregates),
   });
 });
 

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, ApiClientError } from "@/lib/api-client";
+import { safeRedirect } from "@/lib/safeRedirect";
 import { Card, ErrorBanner, Field, buttonClass, inputClass } from "./ui";
 
 /** Shared sign-in / sign-up form — the two differ only in endpoint and copy. */
@@ -25,7 +26,7 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next?: stri
       if (isSignup) await api.signup(email, password);
       else await api.login(email, password);
 
-      router.push(next || "/dashboard");
+      router.push(safeRedirect(next));
       // The dashboard is a client page reading from the API, but refresh() also
       // re-runs the proxy so the redirect rules see the new cookie.
       router.refresh();

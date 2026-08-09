@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/db";
 import { createPaymentSchema } from "@/lib/validation";
-import { validationErrorFromZod, withErrorHandling } from "@/lib/errors";
+import { ApiError, validationErrorFromZod, withErrorHandling } from "@/lib/errors";
 import { requireUser } from "@/lib/auth";
 import { recordPayment } from "@/lib/payments";
 import { serializeOrderDetail } from "@/lib/serialize";
@@ -14,9 +14,18 @@ type Context = RouteContext<"/api/orders/[id]/payments">;
 /**
  * POST /api/orders/:id/payments — record a payment against an order.
  *
- * All the interesting behaviour (atomic over-payment rejection) lives in
- * `recordPayment`; this handler is HTTP plumbing. Over-payment surfaces as a
- * 422 whose `meta.maxAllowed` tells the client exactly what would have fit.
+ * All the interesting behaviour (atomic over-payment rejection, idempotent
+ * retries) lives in `recordPayment`; this handler is HTTP plumbing.
+ * Over-payment surfaces as a 422 whose `meta.maxAllowed` tells the client
+ * exactly what would have fit.
+ *
+ * An `Idempotency-Key` header — the conventional header name for this (see
+ * Stripe, GitHub, etc.) — lets a client safely retry a payment whose response
+ * it never saw (dropped connection, timeout) without risking a double
+ * charge: the same key returns the original payment instead of creating a
+ * second one. It is optional; omitting it keeps the old at-most-once-per-call
+ * behaviour, where a genuine retry is indistinguishable from a second
+ * intended payment.
  */
 export const POST = withErrorHandling(async (request: Request, context: Context) => {
   const user = await requireUser();
@@ -26,6 +35,12 @@ export const POST = withErrorHandling(async (request: Request, context: Context)
   if (!parsed.success) throw validationErrorFromZod(parsed.error);
   const { amount, date, note } = parsed.data;
 
+  const idempotencyKeyHeader = request.headers.get("Idempotency-Key")?.trim();
+  if (idempotencyKeyHeader !== undefined && idempotencyKeyHeader.length > 200) {
+    throw new ApiError("validation_error", "Idempotency-Key must be 200 characters or fewer.");
+  }
+  const idempotencyKey = idempotencyKeyHeader || undefined;
+
   await connectToDatabase();
 
   const { order, payment } = await recordPayment({
@@ -34,6 +49,7 @@ export const POST = withErrorHandling(async (request: Request, context: Context)
     amountCents: amount,
     date,
     note,
+    idempotencyKey,
   });
 
   return NextResponse.json(

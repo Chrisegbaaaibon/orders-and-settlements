@@ -52,6 +52,50 @@ export function parseDollarsToCents(input: unknown): number {
   return sign === "-" ? -cents : cents;
 }
 
+/**
+ * Compute one line's total and validate it stays inside both
+ * `Number.isSafeInteger` and the same `MAX_AMOUNT_CENTS` ceiling applied to
+ * individual dollar inputs. Unit price alone is bounded at parse time, but
+ * quantity (up to 1,000,000) can still push `quantity * unitPriceCents` past
+ * `Number.MAX_SAFE_INTEGER` — e.g. a $1B unit price times a million units —
+ * so the multiplication itself has to be checked, not just its inputs.
+ */
+export function computeLineTotalCents(quantity: number, unitPriceCents: number): number {
+  const lineTotalCents = quantity * unitPriceCents;
+  if (!Number.isSafeInteger(lineTotalCents) || lineTotalCents > MAX_AMOUNT_CENTS) {
+    throw new MoneyParseError(
+      `Line total exceeds the maximum of ${formatCents(MAX_AMOUNT_CENTS)} (quantity × unit price too large)`,
+    );
+  }
+  return lineTotalCents;
+}
+
+/** Sum line totals into a subtotal, re-checking the ceiling at every step. */
+export function sumLineTotalsCents(lineTotalsCents: number[]): number {
+  let subtotalCents = 0;
+  for (const cents of lineTotalsCents) {
+    subtotalCents += cents;
+    if (!Number.isSafeInteger(subtotalCents) || subtotalCents > MAX_AMOUNT_CENTS) {
+      throw new MoneyParseError(`Order total exceeds the maximum of ${formatCents(MAX_AMOUNT_CENTS)}`);
+    }
+  }
+  return subtotalCents;
+}
+
+export interface LineItemAmounts {
+  quantity: number;
+  unitPriceCents: number;
+}
+
+/** Compute every line's total plus the order subtotal in one safe-integer pass. */
+export function computeLineTotals(items: LineItemAmounts[]): {
+  lineTotalsCents: number[];
+  subtotalCents: number;
+} {
+  const lineTotalsCents = items.map((item) => computeLineTotalCents(item.quantity, item.unitPriceCents));
+  return { lineTotalsCents, subtotalCents: sumLineTotalsCents(lineTotalsCents) };
+}
+
 /** Render integer cents as a plain decimal string, e.g. 123450 -> "1234.50". */
 export function centsToDollarString(cents: number): string {
   const negative = cents < 0;

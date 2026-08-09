@@ -19,6 +19,7 @@ export type ApiErrorCode =
   | "over_payment"
   | "order_locked"
   | "conflict"
+  | "rate_limited"
   | "internal_error";
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
@@ -29,6 +30,7 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   conflict: 409,
   order_locked: 409,
   over_payment: 422,
+  rate_limited: 429,
   internal_error: 500,
 };
 
@@ -47,6 +49,7 @@ export class ApiError extends Error {
   readonly hint?: string;
   readonly details?: { path: string; message: string }[];
   readonly meta?: Record<string, unknown>;
+  readonly headers?: Record<string, string>;
 
   constructor(
     code: ApiErrorCode,
@@ -55,6 +58,8 @@ export class ApiError extends Error {
       hint?: string;
       details?: { path: string; message: string }[];
       meta?: Record<string, unknown>;
+      /** Extra response headers, e.g. `Retry-After` for `rate_limited`. */
+      headers?: Record<string, string>;
     } = {},
   ) {
     super(message);
@@ -62,6 +67,7 @@ export class ApiError extends Error {
     this.hint = options.hint;
     this.details = options.details;
     this.meta = options.meta;
+    this.headers = options.headers;
   }
 
   get status(): number {
@@ -79,7 +85,7 @@ export class ApiError extends Error {
           ...(this.meta ? { meta: this.meta } : {}),
         },
       },
-      { status: this.status },
+      { status: this.status, ...(this.headers ? { headers: this.headers } : {}) },
     );
   }
 }

@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { clearTestDatabase, startTestDatabase, stopTestDatabase } from "@/test/setup";
 import { Order, type OrderHydrated } from "@/models/Order";
-import { recordPayment } from "./payments";
+import { recordPayment, type RecordPaymentResult } from "./payments";
 import { ApiError } from "./errors";
 import { deriveOrderState } from "./status";
 
@@ -224,6 +224,92 @@ describe("over-payment rejection", () => {
     expect(reloaded?.payments).toHaveLength(10);
     expect(reloaded?.amountPaidCents).toBe(100_000);
     expect(stateAt(reloaded!).status).toBe("paid");
+  });
+});
+
+describe("idempotency", () => {
+  it("returns the original payment when the same key is retried sequentially", async () => {
+    const order = await createSampleOrder(); // $1,000
+
+    const first = await recordPayment({
+      userId: USER_ID,
+      orderId: order.id,
+      amountCents: 40_000,
+      idempotencyKey: "retry-key-1",
+    });
+    const second = await recordPayment({
+      userId: USER_ID,
+      orderId: order.id,
+      amountCents: 40_000,
+      idempotencyKey: "retry-key-1",
+    });
+
+    expect(second.payment.id).toBe(first.payment.id);
+
+    const reloaded = await Order.findById(order.id);
+    expect(reloaded?.payments).toHaveLength(1);
+    expect(reloaded?.amountPaidCents).toBe(40_000); // not 80,000
+  });
+
+  it("treats a different key as a genuinely separate payment", async () => {
+    const order = await createSampleOrder();
+
+    await recordPayment({
+      userId: USER_ID,
+      orderId: order.id,
+      amountCents: 40_000,
+      idempotencyKey: "key-a",
+    });
+    await recordPayment({
+      userId: USER_ID,
+      orderId: order.id,
+      amountCents: 40_000,
+      idempotencyKey: "key-b",
+    });
+
+    const reloaded = await Order.findById(order.id);
+    expect(reloaded?.payments).toHaveLength(2);
+    expect(reloaded?.amountPaidCents).toBe(80_000);
+  });
+
+  it("omitting the key keeps the old behaviour: each call is its own payment", async () => {
+    const order = await createSampleOrder();
+
+    await recordPayment({ userId: USER_ID, orderId: order.id, amountCents: 40_000 });
+    await recordPayment({ userId: USER_ID, orderId: order.id, amountCents: 40_000 });
+
+    const reloaded = await Order.findById(order.id);
+    expect(reloaded?.payments).toHaveLength(2);
+    expect(reloaded?.amountPaidCents).toBe(80_000);
+  });
+
+  it("never double-charges when two copies of the same retry race each other", async () => {
+    const order = await createSampleOrder(); // $1,000
+
+    const results = await Promise.allSettled([
+      recordPayment({
+        userId: USER_ID,
+        orderId: order.id,
+        amountCents: 90_000,
+        idempotencyKey: "concurrent-retry",
+      }),
+      recordPayment({
+        userId: USER_ID,
+        orderId: order.id,
+        amountCents: 90_000,
+        idempotencyKey: "concurrent-retry",
+      }),
+    ]);
+
+    // Both calls succeed — from the client's point of view, its retry worked
+    // — but they describe the same single payment, not two.
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+    const [first, second] = results as PromiseFulfilledResult<RecordPaymentResult>[];
+    expect(first.value.payment.id).toBe(second.value.payment.id);
+
+    const reloaded = await Order.findById(order.id);
+    expect(reloaded?.payments).toHaveLength(1);
+    expect(reloaded?.amountPaidCents).toBe(90_000);
   });
 });
 

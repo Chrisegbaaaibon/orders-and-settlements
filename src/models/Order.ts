@@ -4,6 +4,7 @@ import mongoose, {
   type InferSchemaType,
   type Model,
 } from "mongoose";
+import { computeLineTotalCents, sumLineTotalsCents } from "@/lib/money";
 
 /**
  * The Order aggregate.
@@ -38,6 +39,11 @@ const paymentSchema = new Schema(
     date: { type: Date, required: true },
     note: { type: String, trim: true, maxlength: 1000 },
     createdAt: { type: Date, required: true, default: () => new Date() },
+    // Client-supplied retry key (e.g. an `Idempotency-Key` header). Lets
+    // `recordPayment` recognise "the client resent the same request" and
+    // replay the original result instead of risking a second real payment —
+    // see payments.ts.
+    idempotencyKey: { type: String, trim: true, maxlength: 200 },
   },
   { _id: true },
 );
@@ -83,14 +89,20 @@ orderSchema.index({ userId: 1, dueDate: 1 });
  *
  * This runs on every save, so `subtotalCents` / `totalCents` / `lineTotalCents`
  * cannot be set by a client — they are always a function of the line items.
+ *
+ * The API layer rejects quantity/price combinations that would overflow a
+ * safe integer before this ever runs (see `lineItemsArraySchema` in
+ * validation.ts); the same checks are repeated here via `computeLineTotalCents`
+ * / `sumLineTotalsCents` as a backstop for any write that reaches the model
+ * without going through that schema.
  */
 orderSchema.pre("validate", function recomputeTotals() {
   if (!Array.isArray(this.lineItems)) return;
 
   for (const item of this.lineItems) {
-    item.lineTotalCents = item.quantity * item.unitPriceCents;
+    item.lineTotalCents = computeLineTotalCents(item.quantity, item.unitPriceCents);
   }
-  this.subtotalCents = this.lineItems.reduce((sum, item) => sum + item.lineTotalCents, 0);
+  this.subtotalCents = sumLineTotalsCents(this.lineItems.map((item) => item.lineTotalCents));
   this.totalCents = this.subtotalCents;
 });
 

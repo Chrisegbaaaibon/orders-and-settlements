@@ -37,6 +37,8 @@ export interface RecordPaymentInput {
   amountCents: number;
   date?: Date;
   note?: string;
+  /** Client-supplied retry key, e.g. an `Idempotency-Key` header. See below. */
+  idempotencyKey?: string;
 }
 
 export interface RecordPaymentResult {
@@ -55,9 +57,36 @@ export async function recordPayment({
   amountCents,
   date,
   note,
+  idempotencyKey,
 }: RecordPaymentInput): Promise<RecordPaymentResult> {
   if (!mongoose.Types.ObjectId.isValid(orderId)) {
     throw new ApiError("not_found", "Order not found.");
+  }
+
+  const ownerFilter = {
+    _id: new mongoose.Types.ObjectId(orderId),
+    userId: new mongoose.Types.ObjectId(userId),
+  };
+
+  /**
+   * Idempotency: a client retrying after a dropped response (or a double
+   * click that races itself) resends the same key. Two identical-looking
+   * requests are not inherently distinguishable from "pay this order twice,
+   * on purpose" — only the key says which one this is. Two reads guard it:
+   *
+   * 1. Before writing, check whether this key already landed. If it has,
+   *    this is a replay — return the original payment rather than the
+   *    balance guard's over-payment error, which would otherwise fire on a
+   *    now-settled order and turn a harmless retry into a client-visible
+   *    failure.
+   * 2. The write's filter also excludes documents where the key is already
+   *    present (`$ne`), so two copies of the same retry racing each other
+   *    cannot both push a payment — the loser falls through to the
+   *    "raced" re-check below instead of writing a second one.
+   */
+  if (idempotencyKey) {
+    const replay = await findPaymentByIdempotencyKey(ownerFilter, idempotencyKey);
+    if (replay) return replay;
   }
 
   const payment = {
@@ -65,15 +94,16 @@ export async function recordPayment({
     amountCents,
     date: date ?? new Date(),
     ...(note ? { note } : {}),
+    ...(idempotencyKey ? { idempotencyKey } : {}),
     createdAt: new Date(),
   };
 
   const order = await Order.findOneAndUpdate(
     {
-      _id: new mongoose.Types.ObjectId(orderId),
-      userId: new mongoose.Types.ObjectId(userId),
-      // The guard. Evaluated server-side against the current document.
+      ...ownerFilter,
+      // The balance guard. Evaluated server-side against the current document.
       $expr: { $lte: [{ $add: ["$amountPaidCents", amountCents] }, "$totalCents"] },
+      ...(idempotencyKey ? { "payments.idempotencyKey": { $ne: idempotencyKey } } : {}),
     },
     {
       $push: { payments: payment },
@@ -94,10 +124,36 @@ export async function recordPayment({
     };
   }
 
-  // Nothing matched. Distinguish "no such order" from "would over-pay" by
-  // reading the order back — this path is the error case, so the extra read
-  // costs nothing on the happy path.
+  // Nothing matched. A concurrent copy of this same retry may have just won
+  // (see point 2 above) — check for that before falling back to the
+  // over-payment / not-found explanation, which reads the order anyway.
+  if (idempotencyKey) {
+    const replay = await findPaymentByIdempotencyKey(ownerFilter, idempotencyKey);
+    if (replay) return replay;
+  }
+
   throw await explainRejection(userId, orderId, amountCents);
+}
+
+async function findPaymentByIdempotencyKey(
+  ownerFilter: { _id: mongoose.Types.ObjectId; userId: mongoose.Types.ObjectId },
+  idempotencyKey: string,
+): Promise<RecordPaymentResult | null> {
+  const order = await Order.findOne({ ...ownerFilter, "payments.idempotencyKey": idempotencyKey });
+  if (!order) return null;
+
+  const payment = order.payments.find((p) => p.idempotencyKey === idempotencyKey);
+  if (!payment) return null; // Guarded by the query above; unreachable in practice.
+
+  return {
+    order,
+    payment: {
+      id: payment._id.toString(),
+      amountCents: payment.amountCents,
+      date: payment.date,
+      ...(payment.note ? { note: payment.note } : {}),
+    },
+  };
 }
 
 async function explainRejection(

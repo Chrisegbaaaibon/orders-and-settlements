@@ -29,10 +29,21 @@ const FILTERS: { value: Filter; label: string }[] = [
   })),
 ];
 
+const emptyPagination = { page: 1, pageSize: 25, total: 0, totalPages: 1 };
+const emptyAggregates = {
+  billedCents: 0,
+  collectedCents: 0,
+  outstandingCents: 0,
+  overdueCents: 0,
+};
+
 export function DashboardClient() {
   const [orders, setOrders] = useState<OrderSummaryJson[]>([]);
+  const [pagination, setPagination] = useState(emptyPagination);
+  const [aggregates, setAggregates] = useState(emptyAggregates);
   const [filter, setFilter] = useState<Filter>("all");
   const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiClientError | null>(null);
 
@@ -40,14 +51,16 @@ export function DashboardClient() {
     setLoading(true);
     setError(null);
     try {
-      const { orders } = await api.listOrders({ status: filter, search: search.trim() || undefined });
-      setOrders(orders);
+      const result = await api.listOrders({ status: filter, search: search.trim() || undefined, page });
+      setOrders(result.orders);
+      setPagination(result.pagination);
+      setAggregates(result.aggregates);
     } catch (err) {
       if (err instanceof ApiClientError) setError(err);
     } finally {
       setLoading(false);
     }
-  }, [filter, search]);
+  }, [filter, search, page]);
 
   // Debounced so typing in the search box does not fire a request per keystroke.
   useEffect(() => {
@@ -55,23 +68,33 @@ export function DashboardClient() {
     return () => clearTimeout(timer);
   }, [load, search]);
 
+  // A new filter or search term invalidates the current page — e.g. page 3 of
+  // "all" may not exist under "overdue" — so both setters below reset it
+  // directly, rather than reacting to the change in an effect.
+  function changeFilter(value: Filter) {
+    setFilter(value);
+    setPage(1);
+  }
+
+  function changeSearch(value: string) {
+    setSearch(value);
+    setPage(1);
+  }
+
   /**
-   * Totals are computed over the *filtered* set, so they always describe what
-   * is on screen. Summing every order regardless of filter would give numbers
-   * that silently disagree with the table beneath them.
+   * The summary tiles come straight from the server's `aggregates`, computed
+   * over the *complete filtered set* — not just the rows on this page. Summing
+   * only `orders` (the current page) would silently disagree with the number
+   * a "next page" implies exists once pagination is in play.
    */
   const totals = useMemo(
-    () =>
-      orders.reduce(
-        (acc, order) => ({
-          billed: acc.billed + order.totalCents,
-          collected: acc.collected + order.amountPaidCents,
-          outstanding: acc.outstanding + order.amountDueCents,
-          overdue: acc.overdue + (order.isOverdue ? order.amountDueCents : 0),
-        }),
-        { billed: 0, collected: 0, outstanding: 0, overdue: 0 },
-      ),
-    [orders],
+    () => ({
+      billed: aggregates.billedCents,
+      collected: aggregates.collectedCents,
+      outstanding: aggregates.outstandingCents,
+      overdue: aggregates.overdueCents,
+    }),
+    [aggregates],
   );
 
   return (
@@ -80,7 +103,9 @@ export function DashboardClient() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Orders</h1>
           <p className="mt-0.5 text-sm text-muted">
-            {loading ? "Loading…" : `${orders.length} order${orders.length === 1 ? "" : "s"}`}
+            {loading
+              ? "Loading…"
+              : `${pagination.total} order${pagination.total === 1 ? "" : "s"}`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -114,7 +139,7 @@ export function DashboardClient() {
                 key={option.value}
                 role="tab"
                 aria-selected={filter === option.value}
-                onClick={() => setFilter(option.value)}
+                onClick={() => changeFilter(option.value)}
                 className={`rounded-lg px-3 py-1.5 text-sm font-medium transition ${
                   filter === option.value
                     ? "bg-accent text-accent-foreground"
@@ -128,7 +153,7 @@ export function DashboardClient() {
           <input
             type="search"
             value={search}
-            onChange={(event) => setSearch(event.target.value)}
+            onChange={(event) => changeSearch(event.target.value)}
             placeholder="Search customer…"
             aria-label="Search by customer"
             className={`${inputClass} ml-auto w-full sm:w-56`}
@@ -194,6 +219,32 @@ export function DashboardClient() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {pagination.totalPages > 1 && (
+          <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3">
+            <p className="text-sm text-muted">
+              Page {pagination.page} of {pagination.totalPages}
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={pagination.page <= 1 || loading}
+                className={secondaryButtonClass}
+              >
+                Previous
+              </button>
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.min(pagination.totalPages, p + 1))}
+                disabled={pagination.page >= pagination.totalPages || loading}
+                className={secondaryButtonClass}
+              >
+                Next
+              </button>
+            </div>
           </div>
         )}
       </Card>

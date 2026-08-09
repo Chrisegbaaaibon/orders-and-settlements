@@ -55,6 +55,38 @@ export interface OrderDetailJson extends OrderSummaryJson {
   payments: PaymentJson[];
 }
 
+export interface OrderAggregates {
+  billedCents: number;
+  collectedCents: number;
+  outstandingCents: number;
+  overdueCents: number;
+}
+
+export interface OrderAggregatesJson {
+  billedCents: number;
+  billed: string;
+  collectedCents: number;
+  collected: string;
+  outstandingCents: number;
+  outstanding: string;
+  overdueCents: number;
+  overdue: string;
+}
+
+/** Dashboard summary tiles, computed over the complete filtered set — not just the current page. */
+export function serializeOrderAggregates(aggregates: OrderAggregates): OrderAggregatesJson {
+  return {
+    billedCents: aggregates.billedCents,
+    billed: centsToDollarString(aggregates.billedCents),
+    collectedCents: aggregates.collectedCents,
+    collected: centsToDollarString(aggregates.collectedCents),
+    outstandingCents: aggregates.outstandingCents,
+    outstanding: centsToDollarString(aggregates.outstandingCents),
+    overdueCents: aggregates.overdueCents,
+    overdue: centsToDollarString(aggregates.overdueCents),
+  };
+}
+
 /** Line items become read-only once money has been taken against the order. */
 export function isOrderEditable(order: Pick<OrderDoc, "payments">): boolean {
   return order.payments.length === 0;

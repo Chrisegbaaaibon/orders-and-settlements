@@ -111,8 +111,8 @@ All endpoints are under `/api`. Every order route requires a session cookie and 
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
-| `POST` | `/api/auth/signup` | `{ email, password }`, password 8+ chars. Sets the session cookie |
-| `POST` | `/api/auth/login` | `{ email, password }` |
+| `POST` | `/api/auth/signup` | `{ email, password }`, password 8+ chars. Sets the session cookie. Rate-limited per IP |
+| `POST` | `/api/auth/login` | `{ email, password }`. Rate-limited per IP and per account |
 | `POST` | `/api/auth/logout` | Clears the cookie |
 | `GET`  | `/api/auth/me` | `{ user }` or `{ user: null }` |
 
@@ -125,7 +125,7 @@ All endpoints are under `/api`. Every order route requires a session cookie and 
 | `GET` | `/api/orders/:id` | Full detail: line items + payment history |
 | `PATCH` | `/api/orders/:id` | Any subset of the create fields |
 | `DELETE` | `/api/orders/:id` | Blocked once payments exist |
-| `POST` | `/api/orders/:id/payments` | `{ amount, date?, note? }` |
+| `POST` | `/api/orders/:id/payments` | `{ amount, date?, note? }`. Optional `Idempotency-Key` header — retrying with the same key returns the original payment instead of recording a second one |
 | `GET` | `/api/orders/export` | CSV download. Query: `from`, `to` (by due date, inclusive) |
 
 ### Money on the wire
@@ -292,16 +292,45 @@ The API returns an `editable` flag so the UI can reflect this without duplicatin
 npm test
 ```
 
-36 tests, all passing. Integration tests run against a real MongoDB via `mongodb-memory-server` — the over-payment guard is a `$expr` condition the *database* evaluates, so mocking the driver would test nothing that matters.
+134 tests, all passing. Integration tests run against a real MongoDB via `mongodb-memory-server` — the over-payment guard is a `$expr` condition the *database* evaluates, so mocking the driver would test nothing that matters.
 
 | File | Covers |
 | ---- | ------ |
-| [`money.test.ts`](src/lib/money.test.ts) | Cent parsing, float-drift cases (`19.99`), sub-cent rejection, round-tripping |
+| [`money.test.ts`](src/lib/money.test.ts) | Cent parsing, float-drift cases (`19.99`), sub-cent rejection, round-tripping, safe-integer overflow on `quantity × unitPrice` and the order subtotal |
 | [`status.test.ts`](src/lib/status.test.ts) | Every status, precedence, and each documented edge case |
 | [`orderQuery.test.ts`](src/lib/orderQuery.test.ts) | The DB filter agrees with the pure function on every state, and the filters partition the set |
-| [`payments.test.ts`](src/lib/payments.test.ts) | Totals, the brief's sample scenario end to end, over-payment boundaries, **concurrency**, tenant isolation, status transitions over time |
+| [`validation.test.ts`](src/lib/validation.test.ts) | Calendar-date validation, incl. invalid dates like Feb 30 that `Date.UTC` would otherwise silently roll forward |
+| [`safeRedirect.test.ts`](src/lib/safeRedirect.test.ts) | Post-login `?next=` is restricted to an internal path — rejects scheme-relative, `javascript:`, and control-character payloads |
+| [`payments.test.ts`](src/lib/payments.test.ts) | Totals, the brief's sample scenario end to end, over-payment boundaries, **concurrency**, idempotency-key replay (including a concurrent-retry race), tenant isolation, status transitions over time |
+| [`orders.test.ts`](src/lib/orders.test.ts) | Metadata/line-item updates, the line-item-lock and delete-lock rules, tenant isolation, and **the payment-vs-edit / payment-vs-delete races** — the same no-await `Promise.allSettled` technique as the payment concurrency tests, asserting the order is never left over-paid or silently destroyed regardless of which side wins |
+| [`rateLimit.test.ts`](src/lib/rateLimit.test.ts) | Fixed-window limiting, per-key isolation, window reset, the `Retry-After` header |
+| [`auth/login/route.test.ts`](src/app/api/auth/login/route.test.ts) | `DUMMY_HASH` is a structurally valid, correctly-timed bcrypt hash; real login/failure cases; per-account and per-IP rate limiting — all over real HTTP requests |
+| [`auth/signup/route.test.ts`](src/app/api/auth/signup/route.test.ts) | Account creation, duplicate-email conflict, validation, per-IP rate limiting |
+| [`auth/logout`, `auth/me` route tests](src/app/api/auth/logout/route.test.ts) | Session clearing; `{ user: null }` for signed-out/tampered tokens rather than a 401 |
+| [`api/orders/route.test.ts`](src/app/api/orders/route.test.ts) | List/create over real HTTP: pagination metadata, **aggregates computed over the whole filtered set** (not just the current page), search, status filter, tenant isolation, safe-integer and calendar-date rejection |
+| [`api/orders/[id]/route.test.ts`](src/app/api/orders/%5Bid%5D/route.test.ts) | GET/PATCH/DELETE over real HTTP, incl. the line-item lock and tenant-isolation 404s |
+| [`api/orders/[id]/payments/route.test.ts`](src/app/api/orders/%5Bid%5D/payments/route.test.ts) | Recording a payment, over-payment's `meta.maxAllowed`, `Idempotency-Key` header handling over real HTTP |
+| [`api/orders/export/route.test.ts`](src/app/api/orders/export/route.test.ts) | CSV header/row shape, tenant isolation, due-date range filtering, the formula-injection guard |
+
+Authenticated route tests call the exported route handlers directly with a mocked `next/headers` cookie jar ([`src/test/authMock.ts`](src/test/authMock.ts)) rather than a real Next request context, which App Router's `cookies()` requires and a bare function call doesn't have. Only that one Next-owned primitive is faked; everything downstream (JWT signing/verification, the route handler itself) runs unmodified.
 
 The brief's sample scenario is encoded as a test (`"walks pending -> partially_paid -> paid and rejects the extra dollar"`) and was also run manually against the live app.
+
+### End-to-end (Playwright)
+
+```bash
+npx playwright install chromium   # first run only
+npm run test:e2e
+```
+
+Drives a real browser against a real (in-memory) MongoDB and a real `next build && next start` — the one layer the vitest suite structurally can't reach, since faking `cookies()` only gets you past route handlers called directly, not real navigation, real Set-Cookie, or real rendered layout.
+
+| File | Covers |
+| ---- | ------ |
+| [`sample-scenario.spec.ts`](e2e/sample-scenario.spec.ts) | Sign up → create the $500×2 order due in 7 days → $400 partial payment → $600.01 over-payment rejected with a one-click "use $600.00 instead" correction → settled → dashboard reflects it. No horizontal overflow at the end. |
+| [`dashboard.spec.ts`](e2e/dashboard.spec.ts) | 30 seeded orders: pagination controls, page-independent aggregate totals, filter changes resetting to page 1, CSV export via a real download |
+
+Both files run under two Playwright projects: `chromium` (desktop) and `mobile` (a 390px viewport — the same width used for the manual mobile check below), so the sample scenario and the pagination UI are each verified once at each width. (`mobile` runs on Chromium rather than Playwright's WebKit iPhone preset — see the comment in `playwright.config.ts` for why: it's a Secure-cookie-over-plain-HTTP quirk specific to testing a production build over `http://127.0.0.1`, not a real app or browser-compatibility bug.)
 
 ---
 
@@ -310,7 +339,6 @@ The brief's sample scenario is encoded as a test (`"walks pending -> partially_p
 **Correctness and money**
 
 - **Refunds**, as negative-amount entries of a distinct type rather than deletions, so the payment history remains an append-only record.
-- **Idempotency keys** on `POST /payments`. The atomic guard prevents over-payment, but a double-submitted $400 payment on a $1,000 order is two *valid* payments — only the caller knows it was one intent.
 - **Currency.** Every amount is implicitly USD. A `currency` field on the order, with payments constrained to match it.
 
 **The audit log, and why it is not here**
@@ -319,8 +347,7 @@ The obvious implementation — append a row whenever a payment write changes the
 
 **Operational**
 
-- Rate limiting on the auth routes.
+- The auth rate limiter is in-memory and per-process — fine for a single instance, but needs a shared store (Redis, etc.) once the app runs on more than one.
 - Structured logging with request ids; `console.error` is a placeholder.
-- Cursor-based pagination on the dashboard. Offset paging degrades on deep pages, though it is fine at the scale this handles today.
-- E2E tests (Playwright) over the flows verified by hand here.
-- CI running `typecheck`, `lint`, and `test` on every push.
+- Cursor-based pagination on the dashboard. Offset paging (now implemented, with page-independent aggregate totals) degrades on deep pages, though it is fine at the scale this handles today.
+- CI running `typecheck`, `lint`, `test`, and `test:e2e` on every push.
